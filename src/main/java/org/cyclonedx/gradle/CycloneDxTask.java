@@ -340,7 +340,7 @@ public class CycloneDxTask extends DefaultTask {
             .collect(Collectors.toSet());
         for(Dependency childDependency : childDependencies) {
             for(Dependency grandchildDependency : grandchildDependencies) {
-                getLogger().info(childDependency.getRef() + " -> " + grandchildDependency.getRef());
+                getLogger().debug(childDependency.getRef() + " depends on " + grandchildDependency.getRef());
                 childDependency.addDependency(grandchildDependency);
             }
         }
@@ -352,6 +352,24 @@ public class CycloneDxTask extends DefaultTask {
         for(ResolvedDependency child : resolvedDependencies) {
             populateDependencies(child, dependencies, builtDependencies);
         }
+    }
+
+    /**
+     * We constructed a unique model dependency object, and built a reference graph.
+     * That is redundant to serialize, so flatten.
+     * @param dependencies map of ref to model dependency object
+     * @return a list of new model dependency objects, which contain exactly one level of nested dependencies
+     */
+    private List<Dependency> flattenDependencies(Map<String, Dependency> dependencies) {
+        return dependencies.entrySet().stream()
+            .map(entry -> {
+                Dependency topLevel = new Dependency(entry.getKey());
+                topLevel.setDependencies(entry.getValue().getDependencies().stream()
+                    .map(d -> new Dependency(d.getRef()))
+                    .collect(Collectors.toList()));
+                return topLevel;
+            })
+            .collect(Collectors.toList());
     }
 
     /**
@@ -367,7 +385,7 @@ public class CycloneDxTask extends DefaultTask {
                 bom.setSerialNumber("urn:uuid:" + UUID.randomUUID().toString());
             }
             bom.setComponents(new ArrayList<>(components));
-            bom.setDependencies(new ArrayList<>(dependencies.values()));
+            bom.setDependencies(flattenDependencies(dependencies));
             final BomGenerator bomGenerator = BomGeneratorFactory.create(schemaVersion, bom);
             bomGenerator.generate();
             final String bomString = bomGenerator.toXmlString();
