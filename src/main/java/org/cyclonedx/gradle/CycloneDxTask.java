@@ -29,16 +29,17 @@ import org.cyclonedx.model.Bom;
 import org.cyclonedx.model.Component;
 import org.cyclonedx.model.Hash;
 import org.cyclonedx.model.License;
+import org.cyclonedx.model.ext.dependencyGraph.Dependency;
 import org.cyclonedx.util.BomUtils;
 import org.gradle.api.DefaultTask;
 import org.gradle.api.GradleException;
 import org.gradle.api.Project;
 import org.gradle.api.artifacts.Configuration;
-import org.gradle.api.artifacts.Dependency;
 import org.gradle.api.artifacts.ModuleVersionIdentifier;
 import org.gradle.api.artifacts.ResolveException;
 import org.gradle.api.artifacts.ResolvedArtifact;
 import org.gradle.api.artifacts.ResolvedConfiguration;
+import org.gradle.api.artifacts.ResolvedDependency;
 import org.gradle.api.tasks.Input;
 import org.gradle.api.tasks.TaskAction;
 import javax.xml.parsers.ParserConfigurationException;
@@ -124,6 +125,8 @@ public class CycloneDxTask extends DefaultTask {
                 .map(p -> p.getGroup() + ":" + p.getName() + ":" + p.getVersion())
                 .collect(Collectors.toSet());
 
+        final Map<String, Dependency> dependencies = Collections.synchronizedMap(new HashMap<>());
+
         final Set<Component> components = getProject().getAllprojects().stream()
             .flatMap(p -> p.getConfigurations().stream())
             .filter(configuration -> !shouldSkipConfiguration(configuration) && canBeResolved(configuration))
@@ -148,12 +151,14 @@ public class CycloneDxTask extends DefaultTask {
                     });
                     Collections.sort(depsFromConfig);
                     getLogger().info("BOM inclusion for configuration {} : {}", configuration.getName(), depsFromConfig);
+
+                    populateDependencies(resolvedConfiguration.getFirstLevelModuleDependencies(), dependencies, builtDependencies);
                 }
                 return componentsFromConfig.stream();
             })
             .collect(Collectors.toSet());
 
-        writeBom(components);
+        writeBom(components, dependencies);
     }
 
     private boolean canBeResolved(Configuration configuration) {
@@ -189,7 +194,7 @@ public class CycloneDxTask extends DefaultTask {
                 return resolvedMavenProjects.get(dependencyName);
             }
         }
-        final Dependency pomDep = getProject()
+        final org.gradle.api.artifacts.Dependency pomDep = getProject()
             .getDependencies()
             .create(dependencyName + "@pom");
         final Configuration pomCfg = getProject()
@@ -237,6 +242,31 @@ public class CycloneDxTask extends DefaultTask {
         }
     }
 
+    private PackageURL getPurlFromArtifact(ResolvedArtifact artifact) {
+        try {
+            TreeMap<String, String> qualifiers = null;
+            if (artifact.getType() != null || artifact.getClassifier() != null) {
+                qualifiers = new TreeMap<>();
+                if (artifact.getType() != null) {
+                    qualifiers.put("type", artifact.getType());
+                }
+                if (artifact.getClassifier() != null) {
+                    qualifiers.put("classifier", artifact.getClassifier());
+                }
+            }
+            final PackageURL purl = new PackageURL(PackageURL.StandardTypes.MAVEN,
+                artifact.getModuleVersion().getId().getGroup(),
+                artifact.getModuleVersion().getId().getName(),
+                artifact.getModuleVersion().getId().getVersion(),
+                qualifiers,
+                null);
+            return purl;
+        } catch (MalformedPackageURLException e) {
+            getLogger().warn("An unexpected issue occurred attempting to create a PackageURL for " + artifact.getModuleVersion().getId().getName(), e);
+        }
+        return null;
+    }
+
     private Component convertArtifact(ResolvedArtifact artifact) {
         final Component component = new Component();
         component.setGroup(artifact.getModuleVersion().getId().getGroup());
@@ -258,23 +288,9 @@ public class CycloneDxTask extends DefaultTask {
             component.setModified(false);
         }
 
-        try {
-            TreeMap<String, String> qualifiers = null;
-            if (artifact.getType() != null || artifact.getClassifier() != null) {
-                qualifiers = new TreeMap<>();
-                if (artifact.getType() != null) {
-                    qualifiers.put("type", artifact.getType());
-                }
-                if (artifact.getClassifier() != null) {
-                    qualifiers.put("classifier", artifact.getClassifier());
-                }
-            }
-            final PackageURL purl = new PackageURL(PackageURL.StandardTypes.MAVEN,
-                    component.getGroup(), component.getName(), component.getVersion(), qualifiers, null);
+        final PackageURL purl = getPurlFromArtifact(artifact);
+        if(purl != null) {
             component.setPurl(purl.canonicalize());
-
-        } catch (MalformedPackageURLException e) {
-            getLogger().warn("An unexpected issue occurred attempting to create a PackageURL for " + component.getName(), e);
         }
 
         if (mavenHelper.isDescribedArtifact(artifact)) {
@@ -292,10 +308,58 @@ public class CycloneDxTask extends DefaultTask {
     }
 
     /**
+     * @param child a resolved dependency from a configuration
+     * @param dependencies map of ref to model dependency object
+     * @param builtDependencies local project artifacts, excluded from the bom
+     * @return the unique model dependency object from the map, creating a new one iff necessary
+     */
+    private Set<Dependency> getArtifactDependencies(ResolvedDependency child,
+        Map<String, Dependency> dependencies,
+        Set<String> builtDependencies) {
+
+            return child.getModuleArtifacts().stream()
+            .filter(artifact -> !builtDependencies.contains(getDependencyName(artifact)))
+            .map(artifact -> getPurlFromArtifact(artifact))
+            .filter(purl -> purl != null)
+            .map(purl -> dependencies.computeIfAbsent(purl.canonicalize(), ref -> new Dependency(ref)))
+            .collect(Collectors.toSet());
+    }
+
+    /**
+     * Fill in the model dependency objects with the list of their dependents
+     * @param child a resolved dependency from a configuration
+     * @param dependencies map of ref to model dependency object
+     * @param builtDependencies local project artifacts, excluded from the bom
+     */
+    private void populateDependencies(ResolvedDependency child,
+        Map<String, Dependency> dependencies,
+        Set<String> builtDependencies) {
+        final Set<Dependency> childDependencies = getArtifactDependencies(child, dependencies, builtDependencies);
+        final Set<Dependency> grandchildDependencies = child.getChildren().stream()
+            .flatMap(grandchild -> getArtifactDependencies(grandchild, dependencies, builtDependencies).stream())
+            .collect(Collectors.toSet());
+        for(Dependency childDependency : childDependencies) {
+            for(Dependency grandchildDependency : grandchildDependencies) {
+                getLogger().info(childDependency.getRef() + " -> " + grandchildDependency.getRef());
+                childDependency.addDependency(grandchildDependency);
+            }
+        }
+    }
+
+    private void populateDependencies(Set<ResolvedDependency> resolvedDependencies,
+        Map<String, Dependency> dependencies,
+        Set<String> builtDependencies) {
+        for(ResolvedDependency child : resolvedDependencies) {
+            populateDependencies(child, dependencies, builtDependencies);
+        }
+    }
+
+    /**
      * Ported from Maven plugin.
      * @param components The CycloneDX components extracted from gradle dependencies
+     * @param dependencies map of ref to model dependency object
      */
-    protected void writeBom(Set<Component> components) throws GradleException{
+    protected void writeBom(Set<Component> components, Map<String, Dependency> dependencies) throws GradleException{
         try {
             getLogger().info(MESSAGE_CREATING_BOM);
             final Bom bom = new Bom();
@@ -303,6 +367,7 @@ public class CycloneDxTask extends DefaultTask {
                 bom.setSerialNumber("urn:uuid:" + UUID.randomUUID().toString());
             }
             bom.setComponents(new ArrayList<>(components));
+            bom.setDependencies(new ArrayList<>(dependencies.values()));
             final BomGenerator bomGenerator = BomGeneratorFactory.create(schemaVersion, bom);
             bomGenerator.generate();
             final String bomString = bomGenerator.toXmlString();
