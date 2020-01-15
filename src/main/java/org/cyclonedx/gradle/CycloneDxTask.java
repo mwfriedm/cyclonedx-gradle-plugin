@@ -308,10 +308,11 @@ public class CycloneDxTask extends DefaultTask {
     }
 
     /**
+     * Get the dependency objects for all the artifacts of the given resolved dependency
      * @param child a resolved dependency from a configuration
      * @param dependencies map of ref to model dependency object
-     * @param builtDependencies local project artifacts, excluded from the bom
-     * @return the unique model dependency object from the map, creating a new one iff necessary
+     * @param builtDependencies local projects, excluded from the bom
+     * @return the unique model dependency objects from the map, creating new ones iff necessary
      */
     private Set<Dependency> getArtifactDependencies(ResolvedDependency child,
         Map<String, Dependency> dependencies,
@@ -326,10 +327,13 @@ public class CycloneDxTask extends DefaultTask {
     }
 
     /**
-     * Fill in the model dependency objects with the list of their dependents
+     * Fill in the model dependency objects with the list of their dependents.
+     * I.e. the edges of the dependency graph.
+     * Note that the edges of the dependency graph can be overridden on a per configuration basis,
+     * so this can't be cached for a given ResolvedDependency.
      * @param child a resolved dependency from a configuration
      * @param dependencies map of ref to model dependency object
-     * @param builtDependencies local project artifacts, excluded from the bom
+     * @param builtDependencies local projects, excluded from the bom
      */
     private void populateDependencies(ResolvedDependency child,
         Map<String, Dependency> dependencies,
@@ -355,7 +359,7 @@ public class CycloneDxTask extends DefaultTask {
     }
 
     /**
-     * We constructed a unique model dependency object, and built a reference graph.
+     * We constructed unique model dependency objects, and built a reference graph between them.
      * That is redundant to serialize, so flatten.
      * @param dependencies map of ref to model dependency object
      * @return a list of new model dependency objects, which contain exactly one level of nested dependencies
@@ -364,9 +368,11 @@ public class CycloneDxTask extends DefaultTask {
         return dependencies.entrySet().stream()
             .map(entry -> {
                 Dependency topLevel = new Dependency(entry.getKey());
-                topLevel.setDependencies(entry.getValue().getDependencies().stream()
-                    .map(d -> new Dependency(d.getRef()))
-                    .collect(Collectors.toList()));
+                if(entry.getValue().getDependencies() != null) {
+                    topLevel.setDependencies(entry.getValue().getDependencies().stream()
+                        .map(d -> new Dependency(d.getRef()))
+                        .collect(Collectors.toList()));
+                }
                 return topLevel;
             })
             .collect(Collectors.toList());
